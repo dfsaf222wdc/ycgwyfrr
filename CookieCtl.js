@@ -1,6 +1,6 @@
 /**
  * Cookie 管控台 for Surge
- * 版本 1.0.1
+ * 版本 1.0.2
  *
  * 同一个脚本承担四种角色，按 Surge 传入的环境自动区分：
  *   1. 管理页面：拦截 http://cookie.ctl 的请求，返回 WebUI 和 JSON 接口
@@ -17,7 +17,7 @@
  */
 'use strict';
 
-var VERSION = '1.0.1';
+var VERSION = '1.0.2';
 var UI_HOST = 'cookie.ctl';
 var DEFAULT_SCRIPT = 'https://raw.githubusercontent.com/dfsaf222wdc/ycgwyfrr/refs/heads/main/CookieCtl.js';
 
@@ -626,7 +626,9 @@ function compileParams(params) {
         } else if (own(KNOWN_ATTRS, lc)) {
           r.push({ t: 'attr', a: KNOWN_ATTRS[lc], v: p.value, only: globListToRe(p.only) });
         } else {
+          /* WebUI 里「替换 Cookie 值」写在 resp 上：请求 Cookie 和响应 Set-Cookie 都要改，否则 App 请求里根本没有这条 Cookie */
           r.push({ t: 'val', n: p.name, v: p.value });
+          q.push({ t: 'set', n: p.name, v: p.value });
         }
         break;
       case 'block':
@@ -649,7 +651,7 @@ function compileParams(params) {
 
 function makeIndex(cfg, memo) {
   var idx = {
-    v: 1, at: now(), on: !!cfg.enabled, dbg: !!cfg.debug, rules: [],
+    v: 2, at: now(), on: !!cfg.enabled, dbg: !!cfg.debug, rules: [],
     e: Object.create(null), s: Object.create(null), k: Object.create(null), w: Object.create(null)
   };
   function put(map, key, ri) {
@@ -685,8 +687,15 @@ function saveIndex(cfg, memo, meta) {
 
 function loadIndex() {
   var idx = jRead(KEY.idx, null);
-  if (!idx || idx.v !== 1 || !Array.isArray(idx.rules) || !idx.e || !idx.s || !idx.k || !idx.w) return null;
-  return idx;
+  if (idx && idx.v === 2 && Array.isArray(idx.rules) && idx.e && idx.s && idx.k && idx.w) return idx;
+  try {
+    idx = makeIndex(loadConfig(), {});
+    jWrite(KEY.idx, idx);
+    return idx;
+  } catch (e) {
+    log('重建索引失败', (e && e.message) || e);
+    return null;
+  }
 }
 
 /** 返回命中的规则序号（按配置顺序）。detail 为 true 时同时返回命中原因。 */
@@ -1904,7 +1913,7 @@ function describe(p) {
         if (!v) return '去掉' + target + ' 的 ' + name + ' 属性。';
         return '把' + target + ' 的 ' + name + ' 设为 ' + v + '。' + (lc === 'samesite' && v.toLowerCase() === 'none' ? '浏览器要求同时带 Secure，会自动加上。' : '');
       }
-      return name ? '把响应里名为 ' + name + ' 的 Cookie 值替换为 ' + (v || '（空）') + '，没有这条 Cookie 时会补上。' : '填写要替换的 Cookie 名称和值。';
+      return name ? '发出的请求带上 ' + name + '=' + (v || '（空）') + '，响应里同名 Cookie 也会改成这个值。' : '填写要替换的 Cookie 名称和值。';
     case 'block':
       return name ? '阻止网站写入名称匹配 ' + name + ' 的 Cookie。' : '填写要拦截的 Cookie 名称，可用 * 通配，多个用逗号分隔。';
     case 'req':
@@ -1923,7 +1932,7 @@ function crumb(p) {
       if (LIFE[lc]) return h('span', { class: 'crumb' }, name, h('b', null, (p.mode === 'cap' ? '≤ ' : '') + (v || '?')), UNIT[p.unit || 'd']);
       if (FLAGS[lc]) return h('span', { class: 'crumb' }, (FALSY.test(v) ? '去掉 ' : '加上 ') + FLAGS[lc]);
       if (lc === 'path' || lc === 'domain' || lc === 'samesite' || lc === 'priority') return h('span', { class: 'crumb' }, name, h('b', null, v || '删除'));
-      return h('span', { class: 'crumb' }, '替换', h('b', null, name + '=' + v));
+      return h('span', { class: 'crumb req' }, '请求+响应', h('b', null, name + '=' + v));
     case 'block': return h('span', { class: 'crumb' }, '拦截', h('b', null, name));
     case 'req': return h('span', { class: 'crumb req' }, '请求带上', h('b', null, name + '=' + v));
     case 'reqdel': return h('span', { class: 'crumb req' }, '请求去掉', h('b', null, name));
@@ -2056,6 +2065,11 @@ function renderTop() {
 function renderTopNotices() {
   var items = [];
   if (S.srv.indexError) items.push(notice(S.srv.indexError, 'err'));
+  var st = moduleStatus();
+  if (st && st.k === 'idle' && S.srv.cfg.enabled && S.srv.module.domains) {
+    items.push(notice(['规则模块还没装上，WebUI 里保存的 Cookie 不会改到任何请求。请到下方「规则模块」一键安装，或复制内容到 Surge 本地模块并启用。'], 'warn',
+      h('a', { class: 'btn sm', href: '#module' }, '去安装')));
+  }
   if (S.warnings.length) {
     items.push(notice([h('div', null, '保存时有些内容被调整了：'), h('ul', null, S.warnings.map(function (w) { return h('li', null, w); }))], 'warn',
       h('button', { class: 'btn ghost sm', onclick: function () { S.warnings = []; render(); } }, '知道了')));
@@ -2281,7 +2295,8 @@ function renderModule() {
       h('li', null, '在 Surge 的「模块」里新建本地模块，例如命名为 CookieCtl-Rules，粘贴后保存。已经建过的，打开它全选替换即可。'),
       h('li', null, '启用这个模块，并确认 HTTPS 解密（MITM）已开启、证书已安装并信任。')));
     panel.appendChild(h('div', { class: 'actions' },
-      h('button', { class: 'btn primary', onclick: function () {
+      h('a', { class: 'btn primary', href: 'surge:///install-module?url=' + encodeURIComponent(location.origin + '/rules.sgmodule') }, '一键安装到 Surge'),
+      h('button', { class: 'btn', onclick: function () {
         copyText(m.text).then(function (ok) {
           if (ok) toast('已复制模块内容', 'ok');
           else { S.showModule = true; render(); toast('无法自动复制，请在下方手动全选复制', 'warn'); }
