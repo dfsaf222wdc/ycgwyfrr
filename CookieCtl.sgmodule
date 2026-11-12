@@ -1,0 +1,13 @@
+#!name=Cookie 管控台
+#!desc=按域名列表改写 Cookie。用浏览器打开 http://cookie.ctl 管理规则，受控域名还需要安装管理页面生成的「规则模块」。
+#!category=工具
+
+# 通过链接安装的模块，script-path 必须写完整地址；argument 与 script-path 保持一致，
+# 管理页面生成的规则模块会自动引用同一个地址。
+
+[Script]
+CookieCtl-WebUI = type=http-request,pattern=^https?:\/\/cookie\.ctl(?::\d+)?(?:[\/?]|$),requires-body=true,max-size=2097152,timeout=60,script-path=https://raw.githubusercontent.com/dfsaf222wdc/ycgwyfrr/refs/heads/main/CookieCtl.js,argument=https://raw.githubusercontent.com/dfsaf222wdc/ycgwyfrr/refs/heads/main/CookieCtl.js
+CookieCtl-Update = type=cron,cronexp="23 * * * *",timeout=120,script-path=https://raw.githubusercontent.com/dfsaf222wdc/ycgwyfrr/refs/heads/main/CookieCtl.js,argument=https://raw.githubusercontent.com/dfsaf222wdc/ycgwyfrr/refs/heads/main/CookieCtl.js
+
+[MITM]
+hostname = %APPEND% cookie.ctl
