@@ -1,6 +1,6 @@
 /**
  * Cookie 管控台 for Surge
- * 版本 1.0.0
+ * 版本 1.0.1
  *
  * 同一个脚本承担四种角色，按 Surge 传入的环境自动区分：
  *   1. 管理页面：拦截 http://cookie.ctl 的请求，返回 WebUI 和 JSON 接口
@@ -17,9 +17,9 @@
  */
 'use strict';
 
-var VERSION = '1.0.0';
+var VERSION = '1.0.1';
 var UI_HOST = 'cookie.ctl';
-var DEFAULT_SCRIPT = 'CookieCtl.js';
+var DEFAULT_SCRIPT = 'https://raw.githubusercontent.com/dfsaf222wdc/ycgwyfrr/refs/heads/main/CookieCtl.js';
 
 var KEY = {
   cfg: 'CookieCtl.config',
@@ -34,7 +34,7 @@ var LIMIT = {
   sources: 20,
   params: 30,
   nameLen: 40,
-  valueLen: 512,
+  valueLen: 4096,
   urlLen: 2048,
   extraLen: 50000,
   maxLifeSec: 400 * 86400,
@@ -181,20 +181,79 @@ function utf8Decode(bytes) {
 
 /* ------------------------------------------------------------------ */
 /* 请求头 / 响应头                                                       */
-/* 兼容两种形式：普通对象，或 full-header-mode 下的 [{field, value}] 数组   */
+/* 兼容普通对象，以及 full-header-mode 下 {field|name|key|header, value} 数组 */
 /* ------------------------------------------------------------------ */
+
+function headerPair(x) {
+  if (x == null) return null;
+  if (typeof x === 'string') {
+    var cut = x.indexOf(':');
+    if (cut < 0) return { f: x.trim(), v: '' };
+    return { f: x.slice(0, cut).trim(), v: x.slice(cut + 1).trim() };
+  }
+  if (Array.isArray(x) && x.length) {
+    return { f: String(x[0] == null ? '' : x[0]).trim(), v: x[1] == null ? '' : String(x[1]) };
+  }
+  if (typeof x !== 'object') return null;
+  var f = x.field != null ? x.field
+    : x.name != null ? x.name
+    : x.header != null ? x.header
+    : x.key != null ? x.key
+    : x.Field != null ? x.Field
+    : x.Name != null ? x.Name
+    : x.Header != null ? x.Header
+    : x.Key != null ? x.Key
+    : null;
+  var v = x.value != null ? x.value : x.Value != null ? x.Value : null;
+  if (f == null) {
+    var keys = Object.keys(x);
+    if (keys.length === 1) {
+      f = keys[0];
+      v = x[keys[0]];
+    }
+  }
+  if (f == null || String(f).trim() === '') return null;
+  return { f: String(f).trim(), v: v == null ? '' : String(v) };
+}
+
+function detectArrayKeys(raw) {
+  var keys = { f: 'field', v: 'value' };
+  if (!Array.isArray(raw)) return keys;
+  for (var i = 0; i < raw.length; i++) {
+    var x = raw[i];
+    if (!x || typeof x !== 'object' || Array.isArray(x)) continue;
+    if (x.field != null) keys.f = 'field';
+    else if (x.Field != null) keys.f = 'Field';
+    else if (x.name != null) keys.f = 'name';
+    else if (x.Name != null) keys.f = 'Name';
+    else if (x.header != null) keys.f = 'header';
+    else if (x.Header != null) keys.f = 'Header';
+    else if (x.key != null) keys.f = 'key';
+    else if (x.Key != null) keys.f = 'Key';
+    else continue;
+    if (x.value != null) keys.v = 'value';
+    else if (x.Value != null) keys.v = 'Value';
+    break;
+  }
+  return keys;
+}
 
 function HeaderBag(raw) {
   var self = this;
   this.isArray = Array.isArray(raw);
   this.items = [];
   this.arrayValued = {};
+  this.arrayKeys = detectArrayKeys(raw);
+  this.parseFailed = false;
   if (this.isArray) {
     raw.forEach(function (x) {
-      if (x && x.field != null) self.items.push({ f: String(x.field), v: x.value == null ? '' : String(x.value) });
+      var it = headerPair(x);
+      if (it && it.f) self.items.push(it);
     });
+    if (raw.length && !this.items.length) this.parseFailed = true;
   } else if (raw && typeof raw === 'object') {
     Object.keys(raw).forEach(function (k) {
+      if (k === '' || k.charAt(0) === ':') return;
       var v = raw[k];
       if (Array.isArray(v)) {
         self.arrayValued[k.toLowerCase()] = true;
@@ -227,10 +286,20 @@ HeaderBag.prototype.replace = function (name, values, fallbackField) {
   var add = values.map(function (v) { return { f: field, v: v }; });
   Array.prototype.splice.apply(kept, [pos, 0].concat(add));
   this.items = kept;
+  if (!this.isArray && lname === 'set-cookie' && values.length > 1) this.arrayValued[lname] = true;
 };
 
 HeaderBag.prototype.output = function () {
-  if (this.isArray) return this.items.map(function (i) { return { field: i.f, value: i.v }; });
+  if (this.isArray) {
+    var fk = this.arrayKeys.f || 'field';
+    var vk = this.arrayKeys.v || 'value';
+    return this.items.map(function (i) {
+      var o = {};
+      o[fk] = i.f;
+      o[vk] = i.v;
+      return o;
+    });
+  }
   var out = {};
   var first = {};
   var self = this;
@@ -412,16 +481,20 @@ function loadMeta() {
 
 function saveMeta(meta) { jWrite(KEY.meta, meta); }
 
+function isRemoteScript(p) {
+  return /^(https?:\/\/|\/|[A-Za-z]:\\)/.test(p) || /\.(js|ts)$/i.test(p) && p.indexOf('/') >= 0;
+}
+
 function scriptPathOf(cfg, meta) {
   if (cfg.scriptPath && validScriptPath(cfg.scriptPath)) return cfg.scriptPath;
-  if (meta && meta.argPath && validScriptPath(meta.argPath)) return meta.argPath;
+  if (meta && meta.argPath && validScriptPath(meta.argPath) && isRemoteScript(meta.argPath)) return meta.argPath;
   return DEFAULT_SCRIPT;
 }
 
 /* 主模块的 WebUI 与定时任务把脚本路径作为 argument 传进来，记下来供生成规则模块使用 */
 function rememberArgPath(meta) {
   var arg = typeof $argument === 'string' ? $argument.trim() : '';
-  if (arg && validScriptPath(arg) && meta.argPath !== arg) {
+  if (arg && validScriptPath(arg) && isRemoteScript(arg) && meta.argPath !== arg) {
     meta.argPath = arg;
     saveMeta(meta);
   }
@@ -550,8 +623,10 @@ function compileParams(params) {
           r.push({ t: 'life', sec: Math.max(0, Math.round(Number(p.value) * UNITS[p.unit])), mode: p.mode, only: globListToRe(p.only) });
         } else if (own(FLAG_ATTRS, lc)) {
           r.push({ t: 'flag', a: FLAG_ATTRS[lc], on: !FALSY_RE.test(p.value), only: globListToRe(p.only) });
+        } else if (own(KNOWN_ATTRS, lc)) {
+          r.push({ t: 'attr', a: KNOWN_ATTRS[lc], v: p.value, only: globListToRe(p.only) });
         } else {
-          r.push({ t: 'attr', a: own(KNOWN_ATTRS, lc) ? KNOWN_ATTRS[lc] : p.name, v: p.value, only: globListToRe(p.only) });
+          r.push({ t: 'val', n: p.name, v: p.value });
         }
         break;
       case 'block':
@@ -683,7 +758,17 @@ function parseSetCookie(s) {
 }
 
 function stringifySetCookie(c) {
-  return [c.first].concat(c.attrs.map(function (a) { return a.v === null ? a.k : a.k + '=' + a.v; })).join('; ');
+  var first = c.name ? (c.name + '=' + (c.value == null ? '' : c.value)) : c.first;
+  return [first].concat(c.attrs.map(function (a) { return a.v === null ? a.k : a.k + '=' + a.v; })).join('; ');
+}
+
+function setCookieValue(c, name, value) {
+  if (c.name.toLowerCase() !== String(name || '').toLowerCase()) return;
+  if (c.value === value && c.first === name + '=' + value) return;
+  c.name = name;
+  c.value = value;
+  c.first = name + '=' + value;
+  c.dirty = true;
 }
 
 function lastAttr(c, lk) {
@@ -764,6 +849,7 @@ function applyResponseActs(str, acts, t) {
       case 'life': applyLife(c, a, t); break;
       case 'flag': setFlag(c, a.a, a.on); break;
       case 'attr': setAttr(c, a.a, a.v); break;
+      case 'val': setCookieValue(c, a.n, a.v); break;
     }
   }
   return c.dirty ? stringifySetCookie(c) : str;
@@ -773,7 +859,8 @@ function applyResponseActs(str, acts, t) {
 function applyRequestActs(cookieStr, acts) {
   var pairs = String(cookieStr || '').split(';').map(function (s) { return s.trim(); }).filter(Boolean).map(function (s) {
     var i = s.indexOf('=');
-    return { n: i >= 0 ? s.slice(0, i).trim() : '', raw: s };
+    var n = i >= 0 ? s.slice(0, i).trim() : s.trim();
+    return { n: n, ln: n.toLowerCase(), raw: s };
   });
   var dirty = false;
   acts.forEach(function (a) {
@@ -781,19 +868,20 @@ function applyRequestActs(cookieStr, acts) {
       var re = getRe(a.m);
       if (!re) return;
       var before = pairs.length;
-      pairs = pairs.filter(function (p) { return !re.test(p.n); });
+      pairs = pairs.filter(function (p) { return !re.test(p.n) && !re.test(p.ln); });
       if (pairs.length !== before) dirty = true;
     } else if (a.t === 'set') {
       var raw = a.n + '=' + a.v;
+      var ln = String(a.n || '').toLowerCase();
       var found = false;
       pairs = pairs.filter(function (p) {
-        if (p.n !== a.n) return true;
+        if (p.ln !== ln && p.n !== a.n) return true;
         if (found) { dirty = true; return false; }
         found = true;
-        if (p.raw !== raw) { p.raw = raw; dirty = true; }
+        if (p.raw !== raw) { p.n = a.n; p.ln = ln; p.raw = raw; dirty = true; }
         return true;
       });
-      if (!found) { pairs.push({ n: a.n, raw: raw }); dirty = true; }
+      if (!found) { pairs.push({ n: a.n, ln: ln, raw: raw }); dirty = true; }
     }
   });
   return dirty ? pairs.map(function (p) { return p.raw; }).join('; ') : null;
@@ -809,30 +897,89 @@ function noteSeen() {
   jWrite(KEY.seen, { sig: sig, at: t });
 }
 
+function headerFallback(raw, name) {
+  if (!raw || typeof raw !== 'object') return [];
+  var lname = name.toLowerCase();
+  var out = [];
+  function push(v) {
+    if (v == null) return;
+    if (Array.isArray(v)) {
+      v.forEach(function (x) {
+        if (x == null) return;
+        if (typeof x === 'object') {
+          var it = headerPair(x);
+          if (it && it.f.toLowerCase() === lname) out.push(it.v);
+          else if (it && !it.f) out.push(it.v);
+          else if (typeof x.value === 'string') out.push(x.value);
+        } else out.push(String(x));
+      });
+      return;
+    }
+    out.push(String(v));
+  }
+  if (Array.isArray(raw)) {
+    raw.forEach(function (x) {
+      var it = headerPair(x);
+      if (it && it.f.toLowerCase() === lname) out.push(it.v);
+    });
+    return out;
+  }
+  Object.keys(raw).forEach(function (k) {
+    if (k.toLowerCase() === lname) push(raw[k]);
+  });
+  if (!out.length) {
+    try {
+      if (raw[name] != null) push(raw[name]);
+      else if (raw[lname] != null) push(raw[lname]);
+      else if (lname === 'cookie' && raw.Cookie != null) push(raw.Cookie);
+      else if (lname === 'set-cookie' && raw['Set-Cookie'] != null) push(raw['Set-Cookie']);
+    } catch (e) { /* 忽略 */ }
+  }
+  return out;
+}
+
 function onResponse() {
   var idx = loadIndex();
   if (!idx || !idx.on || !idx.rules.length) return finish({});
   noteSeen();
-  var bag = new HeaderBag($response.headers);
+  var rawHeaders = $response && $response.headers;
+  var bag = new HeaderBag(rawHeaders);
+  if (bag.parseFailed) {
+    if (idx.dbg) log('无法解析响应头，跳过改写');
+    return finish({});
+  }
   var raw = bag.values('set-cookie');
-  if (!raw.length) return finish({});
+  if (!raw.length) raw = headerFallback(rawHeaders, 'set-cookie');
   var host = hostOf($request && $request.url);
   if (!host) return finish({});
   var acts = collectActs(idx, matchHost(idx, host), 'r');
   if (!acts.length) return finish({});
+  if (!raw.length && !acts.some(function (a) { return a.t === 'val'; })) return finish({});
 
   var t = now();
   var changed = false;
   var mod = 0, drop = 0;
   var out = [];
+  var seen = {};
   raw.forEach(function (v) {
     var list = bag.isArray ? [v] : splitSetCookie(v);
     list.forEach(function (sc) {
+      var parsed = parseSetCookie(sc);
+      if (parsed.name) seen[parsed.name.toLowerCase()] = 1;
       var res = applyResponseActs(sc, acts, t);
       if (res === null) { changed = true; drop++; return; }
       if (res !== sc) { changed = true; mod++; }
       out.push(res);
     });
+  });
+  acts.forEach(function (a) {
+    if (a.t !== 'val') return;
+    var ln = String(a.n || '').toLowerCase();
+    if (!ln || own(seen, ln)) return;
+    seen[ln] = 1;
+    out.push(a.n + '=' + a.v);
+    changed = true;
+    mod++;
   });
   if (!changed) return finish({});
   bag.replace('set-cookie', out, 'Set-Cookie');
@@ -848,8 +995,15 @@ function onRequest() {
   if (!host) return finish({});
   var acts = collectActs(idx, matchHost(idx, host), 'q');
   if (!acts.length) return finish({});
-  var bag = new HeaderBag($request.headers);
-  var next = applyRequestActs(bag.values('cookie').join('; '), acts);
+  var rawHeaders = $request.headers;
+  var bag = new HeaderBag(rawHeaders);
+  if (bag.parseFailed) {
+    if (idx.dbg) log(host, '无法解析请求头，跳过改写');
+    return finish({});
+  }
+  var cur = bag.values('cookie');
+  if (!cur.length) cur = headerFallback(rawHeaders, 'cookie');
+  var next = applyRequestActs(cur.join('; '), acts);
   if (next === null) return finish({});
   bag.replace('cookie', next ? [next] : [], 'Cookie');
   if (idx.dbg) log(host, '改写请求 Cookie');
@@ -888,7 +1042,7 @@ function compactDomains(d) {
 /* 生成的表达式里不含逗号、空格、引号和 #，可以直接写进模块行 */
 function buildPattern(c) {
   var alts = [];
-  if (c.s.length) alts.push('(?:' + HOST_CH + '+\\.)?(?:' + c.s.map(escRe).join('|') + ')');
+  if (c.s.length) alts.push('(?:' + HOST_CH + '+\\.)*(?:' + c.s.map(escRe).join('|') + ')');
   if (c.e.length) alts.push('(?:' + c.e.map(escRe).join('|') + ')');
   if (c.k.length) alts.push(HOST_CH + '*(?:' + c.k.map(escRe).join('|') + ')' + HOST_CH + '*');
   c.w.forEach(function (w) {
@@ -1604,7 +1758,7 @@ pre.code{margin:14px 0 0;max-height:300px;overflow:auto;background:var(--surface
 
 var S = { srv: null, draft: null, base: '', open: {}, busy: '', test: null, testInput: '', showModule: false, warnings: [], loadError: '', barState: '' };
 var UNIT = { s: '秒', m: '分钟', h: '小时', d: '天' };
-var WHERE = [['resp', '改写响应 Cookie 属性'], ['block', '拦截响应 Cookie'], ['req', '设置请求 Cookie'], ['reqdel', '移除请求 Cookie']];
+var WHERE = [['resp', '改写响应 Cookie'], ['block', '拦截响应 Cookie'], ['req', '设置请求 Cookie'], ['reqdel', '移除请求 Cookie']];
 var LIFE = { expires: 1, expire: 1, 'max-age': 1, maxage: 1, expiry: 1, lifetime: 1 };
 var FLAGS = { secure: 'Secure', httponly: 'HttpOnly', partitioned: 'Partitioned' };
 var FALSY = /^(false|0|off|no|关|否|关闭|删除|去掉|remove)$/i;
@@ -1613,6 +1767,7 @@ var PRESETS = [
   ['有效期', { where: 'resp', name: 'expires', value: '20', unit: 'd', mode: 'force', only: '' }, 'value'],
   ['SameSite', { where: 'resp', name: 'SameSite', value: 'Lax', unit: 'd', mode: 'force', only: '' }, 'value'],
   ['拦截 Cookie', { where: 'block', name: '', value: '', unit: 'd', mode: 'force', only: '' }, 'name'],
+  ['替换 Cookie 值', { where: 'resp', name: '', value: '', unit: 'd', mode: 'force', only: '' }, 'name'],
   ['请求 Cookie', { where: 'req', name: '', value: '', unit: 'd', mode: 'force', only: '' }, 'name'],
   ['移除请求 Cookie', { where: 'reqdel', name: '', value: '', unit: 'd', mode: 'force', only: '' }, 'name']
 ];
@@ -1744,8 +1899,12 @@ function describe(p) {
           : target + ' 的有效期统一改为 ' + span + '。';
       }
       if (FLAGS[lc]) return FALSY.test(v) ? '去掉' + target + ' 的 ' + FLAGS[lc] + ' 标记。' : '给' + target + ' 加上 ' + FLAGS[lc] + ' 标记。';
-      if (!v) return '去掉' + target + ' 的 ' + name + ' 属性。';
-      return '把' + target + ' 的 ' + name + ' 设为 ' + v + '。' + (lc === 'samesite' && v.toLowerCase() === 'none' ? '浏览器要求同时带 Secure，会自动加上。' : '');
+      if (LIFE[lc]) return '';
+      if (lc === 'path' || lc === 'domain' || lc === 'samesite' || lc === 'priority') {
+        if (!v) return '去掉' + target + ' 的 ' + name + ' 属性。';
+        return '把' + target + ' 的 ' + name + ' 设为 ' + v + '。' + (lc === 'samesite' && v.toLowerCase() === 'none' ? '浏览器要求同时带 Secure，会自动加上。' : '');
+      }
+      return name ? '把响应里名为 ' + name + ' 的 Cookie 值替换为 ' + (v || '（空）') + '，没有这条 Cookie 时会补上。' : '填写要替换的 Cookie 名称和值。';
     case 'block':
       return name ? '阻止网站写入名称匹配 ' + name + ' 的 Cookie。' : '填写要拦截的 Cookie 名称，可用 * 通配，多个用逗号分隔。';
     case 'req':
@@ -1763,7 +1922,8 @@ function crumb(p) {
     case 'resp':
       if (LIFE[lc]) return h('span', { class: 'crumb' }, name, h('b', null, (p.mode === 'cap' ? '≤ ' : '') + (v || '?')), UNIT[p.unit || 'd']);
       if (FLAGS[lc]) return h('span', { class: 'crumb' }, (FALSY.test(v) ? '去掉 ' : '加上 ') + FLAGS[lc]);
-      return h('span', { class: 'crumb' }, name, h('b', null, v || '删除'));
+      if (lc === 'path' || lc === 'domain' || lc === 'samesite' || lc === 'priority') return h('span', { class: 'crumb' }, name, h('b', null, v || '删除'));
+      return h('span', { class: 'crumb' }, '替换', h('b', null, name + '=' + v));
     case 'block': return h('span', { class: 'crumb' }, '拦截', h('b', null, name));
     case 'req': return h('span', { class: 'crumb req' }, '请求带上', h('b', null, name + '=' + v));
     case 'reqdel': return h('span', { class: 'crumb req' }, '请求去掉', h('b', null, name));
@@ -2077,7 +2237,7 @@ function renderParam(rule, p, j, ctx) {
   var lc = lower(p.name);
   var valPh = isLife(p) ? '20' : lc === 'samesite' ? 'Lax、Strict 或 None' : FLAGS[lc] ? 'true 或 false' : '参数值';
   var valEl = textInput(p.value, function (v) { p.value = v; changed(); },
-    { 'data-k': 'value', placeholder: valPh, inputmode: isLife(p) ? 'decimal' : null, maxlength: 512 });
+    { 'data-k': 'value', placeholder: valPh, inputmode: isLife(p) ? 'decimal' : null, maxlength: 4096 });
 
   if (p.where === 'resp' || p.where === 'req') {
     if (isLife(p)) {
